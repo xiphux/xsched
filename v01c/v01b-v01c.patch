@@ -1,0 +1,455 @@
+diff -u linux-xsched-xiphux/kernel/sched.c linux-xsched-xiphux/kernel/sched.c
+--- linux-xsched-xiphux/kernel/sched.c	2004-07-10 06:29:49.192947752 -0400
++++ linux-xsched-xiphux/kernel/sched.c	2004-07-11 07:21:40.842353512 -0400
+@@ -59,10 +59,12 @@
+  * can work with better when scaling various scheduler parameters,
+  * it's a [ 0 ... 39 ] range.
+  */
+-#define USER_PRIO(p)		((p)-MAX_RT_PRIO)
++#define USER_PRIO(p)		((p)-MAX_RT_PRIO - 10)
+ #define TASK_USER_PRIO(p)	USER_PRIO((p)->static_prio)
+ #define MAX_USER_PRIO		(USER_PRIO(MAX_PRIO))
+ 
++#define US_TO_JIFFIES(x)	((x) * HZ / 1000000)
++#define JIFFIES_TO_US(x)	((x) * 1000000 / HZ)
+ /*
+  * MIN_TIMESLICE is the timeslice that a minimum priority process gets if there
+  * is a maximum priority process runnable. MAX_TIMESLICE is derived from the
+@@ -70,34 +72,76 @@
+  * that the maximum priority process will get. Larger timeslices are attainable
+  * by low priority processes however.
+  */
+-#define RT_TIMESLICE		50		/* 50ms */
+-#define BASE_TIMESLICE		10
+-#define MIN_TIMESLICE		5
+-#define MAX_TIMESLICE		(BASE_TIMESLICE * (MAX_USER_PRIO + 1) / 3)
++#ifdef CONFIG_SYSCTL
++static unsigned int rt_timeslice = 50;
++#else
++#define rt_timeslice		50		/* 50ms */
++#endif
++
++#ifdef CONFIG_SYSCTL
++static unsigned int base_timeslice = 8;
++#else
++#define base_timeslice		8
++#endif
++
++#define MIN_TIMESLICE		(8 * HZ / 1000 ?: 1)
++
++#define MAX_TIMESLICE		(base_timeslice * (MAX_USER_PRIO + 1) / 3 * 2)
+ 
+ /* Maximum amount of history that will be used to calculate priority */
+-#define MAX_SLEEP_SHIFT		19
+-#define MAX_SLEEP		(1UL << MAX_SLEEP_SHIFT) /* roughly 0.52s */
++#ifdef CONFIG_SYSCTL
++static unsigned int max_sleep_shift = 19;
++#else
++#define max_sleep_shift		19
++#endif
++
++#define MAX_SLEEP		(1UL << max_sleep_shift)
+ 
+ /*
+  * Maximum effect that 1 block of activity (run/sleep/etc) can have. This is
+  * will moderate dicard freak events (eg. SIGSTOP)
+  */
+-#define MAX_SLEEP_AFFECT	(MAX_SLEEP/16)
+-#define MAX_RUN_AFFECT		(MAX_SLEEP/2)
+-#define MAX_WAIT_AFFECT		(MAX_SLEEP_AFFECT)
++#ifdef CONFIG_SYSCTL
++static unsigned int max_sleep_affect_factor = 4;
++#else
++#define max_sleep_affect_factor	4
++#endif
++#define MAX_SLEEP_AFFECT	(MAX_SLEEP/max_sleep_affect_factor)
++
++#ifdef CONFIG_SYSCTL
++static unsigned int max_run_affect_factor = 4;
++#else
++#define max_run_affect_factor	4
++#endif
++#define MAX_RUN_AFFECT		(MAX_SLEEP/max_run_affect_factor)
++
++#ifdef CONFIG_SYSCTL
++static unsigned int max_wait_affect_factor = 4;
++#else
++#define max_wait_affect_factor	4
++#endif
++#define MAX_WAIT_AFFECT		(MAX_SLEEP_AFFECT/max_wait_affect_factor)
+ 
+ /*
+  * The amount of history can be decreased (on fork for example). This puts a
+  * lower bound on it.
+  */
+-#define MIN_HISTORY		(MAX_SLEEP/2)
++#ifdef CONFIG_SYSCTL
++static unsigned int min_history_factor = 8;
++#else
++#define min_history_factor	8
++#endif
++#define MIN_HISTORY		(MAX_SLEEP/min_history_factor)
+ 
+ /*
+- * SLEEP_FACTOR is a fixed point factor used to scale history tracking things.
++ * sleep_factor is a fixed point factor used to scale history tracking things.
+  * In particular: total_time, sleep_time, sleep_avg.
+  */
+-#define SLEEP_FACTOR		1024
++#ifdef CONFIG_SYSCTL
++static unsigned int sleep_factor = 1024;
++#else
++#define sleep_factor		1024
++#endif
+ 
+ /*
+  * The scheduler classifies a process as performing one of the following
+@@ -188,7 +232,6 @@
+ # define task_running(rq, p)		((rq)->curr == (p))
+ #endif
+ 
+-#define US_TO_JIFFIES(x)	((x) * HZ / 1000000)
+ static inline unsigned long long clock_us(void)
+ {
+ 	return sched_clock() >> 10;
+@@ -329,11 +372,11 @@
+ 
+ 	ratio = MAX_SLEEP - time;
+ 	tmp = (unsigned long long)ratio*p->total_time + MAX_SLEEP/2;
+-	tmp >>= MAX_SLEEP_SHIFT;
++	tmp >>= max_sleep_shift;
+ 	p->total_time = (unsigned long)tmp;
+ 
+ 	tmp = (unsigned long long)ratio*p->sleep_time + MAX_SLEEP/2;
+-	tmp >>= MAX_SLEEP_SHIFT;
++	tmp >>= max_sleep_shift;
+ 	p->sleep_time = (unsigned long)tmp;
+ 
+ 	if (type != STIME_WAIT) {
+@@ -341,12 +384,12 @@
+ 		if (type == STIME_SLEEP)
+ 			p->sleep_time += time;
+ 
+-		p->sleep_avg = (SLEEP_FACTOR * p->sleep_time) / p->total_time;
++		p->sleep_avg = (sleep_factor * p->sleep_time) / p->total_time;
+ 	}
+ 
+ 	if (p->total_time < MIN_HISTORY) {
+ 		p->total_time = MIN_HISTORY;
+-		p->sleep_time = p->total_time * p->sleep_avg / SLEEP_FACTOR;
++		p->sleep_time = p->total_time * p->sleep_avg / sleep_factor;
+ 	}
+ }
+ 
+@@ -363,17 +406,20 @@
+ 	int idx, base, delta;
+ 	unsigned int timeslice;
+ 
+-	if (unlikely(rt_task(p)))
+-		return RT_TIMESLICE;
++	if (rt_task(p))
++		return rt_timeslice;
+ 
+ 	idx = min(p->prio, rq->min_prio);
+ 	delta = p->prio - idx;
+-	base = BASE_TIMESLICE * (MAX_USER_PRIO + 1) / (delta + 3);
++	base = base_timeslice * (MAX_USER_PRIO + 1) / (delta + 3);
+ 
+-	idx = min(p->static_prio, rq->min_nice);
++	idx = min(rq->min_nice, p->static_prio);
+ 	delta = p->static_prio - idx;
+ 	timeslice = base * 2 / (delta + 2);
+ 
++	timeslice = timeslice * 30 / (60 - USER_PRIO(idx));
++
++	timeslice = timeslice * 1000 / HZ;
+ 	/*
+ 	 * Kernel threads should get an extra bonus.
+ 	 */
+@@ -395,11 +441,11 @@
+ {
+  	int bonus, prio;
+ 
+-	if (unlikely(rt_task(p)))
++	if (rt_task(p))
+ 		return p->prio;
+ 
+-	bonus = ((MAX_USER_PRIO / 3) * p->sleep_avg + (SLEEP_FACTOR / 2)) / SLEEP_FACTOR;
+-	prio = USER_PRIO(p->static_prio) + 10;
++	bonus = ((MAX_USER_PRIO / 3) * p->sleep_avg + (sleep_factor / 2)) / sleep_factor;
++	prio = USER_PRIO(p->static_prio) + 20;
+ 
+ 	prio = MAX_RT_PRIO + prio - bonus;
+ 
+@@ -844,7 +890,7 @@
+ 	p->sleep_avg = current->sleep_avg;
+ 	if (p->total_time < MIN_HISTORY) {
+ 		p->total_time = MIN_HISTORY;
+-		p->sleep_time = p->total_time * p->sleep_avg / SLEEP_FACTOR;
++		p->sleep_time = p->total_time * p->sleep_avg / sleep_factor;
+ 	}
+ 
+ 	/*
+@@ -852,7 +898,7 @@
+ 	 */
+ 	current->sleep_time = 3 * current->sleep_time / 4;
+ 	if (likely(current->total_time != 0)) {
+-		current->sleep_avg = (SLEEP_FACTOR * current->sleep_time)
++		current->sleep_avg = (sleep_factor * current->sleep_time)
+ 			/ current->total_time;
+ 	}
+ }
+@@ -871,6 +917,7 @@
+ 	runqueue_t *rq;
+ 
+ 	rq = task_rq_lock(p, &flags);
++	p->timestamp = clock_us();
+ 	cpu = task_cpu(p);
+ 	this_cpu = smp_processor_id();
+ 
+@@ -900,7 +947,7 @@
+ 			/* Run child last */
+ 			__activate_task(p, rq);
+ 	} else {
+-		runqueue_t *this_rq = cpu_rq(this_cpu);
++		runqueue_t *this_rq = this_rq();
+ 
+ 		/*
+ 		 * Not the local CPU - must adjust timestamp. This should
+@@ -1245,7 +1292,7 @@
+  * can_migrate_task - may task p from runqueue rq be migrated to this_cpu?
+  */
+ static inline
+-int can_migrate_task(const task_t *p, runqueue_t *rq, int this_cpu,
++int can_migrate_task(task_t *p, runqueue_t *rq, int this_cpu,
+ 		     struct sched_domain *sd, enum idle_type idle)
+ {
+ 	/*
+@@ -1823,7 +1870,7 @@
+ 	 * a tick rebalance
+ 	 */
+ 	if (unlikely(p->policy == SCHED_FIFO))
+-		return;
++		goto out;
+ 	spin_lock(&rq->lock);
+ 	rq->cache_ticks++;
+ 	/*
+@@ -1832,6 +1879,7 @@
+ 	 * priority until it either goes to sleep or uses up its
+ 	 * timeslice.
+ 	 */
++#if 0
+ 	if (unlikely(p->policy == SCHED_RR)) {
+ 		/*
+ 		 * RR tasks need a special form of timeslice management.
+@@ -1846,6 +1894,7 @@
+ 		}
+ 		goto out_unlock;
+ 	}
++#endif
+ 	if (task_timeslice(p, rq) <= 1) {
+ 		dequeue_task(p);
+ 		set_tsk_need_resched(p);
+@@ -1907,15 +1956,6 @@
+ 
+ 	spin_lock_irq(&rq->lock);
+ 
+-	if (unlikely(!task_timeslice(prev, rq))) {
+-		dequeue_task(prev);
+-		prev->prio = task_priority(prev);
+-		set_tsk_need_resched(prev);
+-		rq->current_prio_slot = rq->queues + task_priority(p);
+-		enqueue_task(p, rq, rq->current_prio_slot->prio);
+-		update_min_prio(p, rq);
+-	}
+-
+ 	/*
+ 	 * if entering off of a kernel preemption go straight
+ 	 * to picking the next task.
+@@ -1926,10 +1966,22 @@
+ 		if (unlikely((prev->state & TASK_INTERRUPTIBLE) &&
+ 				unlikely(signal_pending(prev))))
+ 			prev->state = TASK_RUNNING;
+-		else
++		else {
+ 			deactivate_task(prev, rq);
++			goto no_check_expired;
++		}
+ 	}
+ 
++	if (unlikely(!task_timeslice(prev, rq))) {
++		dequeue_task(prev);
++		prev->prio = task_priority(prev);
++		set_tsk_need_resched(prev);
++		rq->current_prio_slot = rq->queues + task_priority(p);
++		enqueue_task(p, rq, rq->current_prio_slot->prio);
++		update_min_prio(p, rq);
++	}
++
++no_check_expired:
+ 	cpu = smp_processor_id();
+ 	if (unlikely(needs_idle_balance(rq))) {
+ 		idle_balance(cpu, rq);
+@@ -2670,11 +2722,11 @@
+ 		if (idx < MAX_PRIO)
+ 			rq->current_prio_slot = rq->queues + idx;
+ 		enqueue_task(current, rq, rq->current_prio_slot->prio);
+-		update_min_prio(current, rq);
+ 	} else {
+ 		list_del_init(&current->run_list);
+ 		list_add_tail(&current->run_list, &rq->current_prio_slot->queue);
+ 	}
++	update_min_prio(current, rq);
+ 	/*
+ 	 * Since we are going to call schedule() anyway, there's
+ 	 * no need to preempt or enable interrupts:
+@@ -3636,0 +3689,112 @@
++
++#ifdef CONFIG_SYSCTL
++enum
++{
++	CPU_SCHED_END_OF_LIST=0,
++	CPU_SCHED_RT_TIMESLICE=1,
++	CPU_SCHED_BASE_TIMESLICE,
++	CPU_SCHED_MAX_SLEEP_SHIFT,
++	CPU_SCHED_MAX_SLEEP_AFFECT_FACTOR,
++	CPU_SCHED_MAX_RUN_AFFECT_FACTOR,
++	CPU_SCHED_MAX_WAIT_AFFECT_FACTOR,
++	CPU_SCHED_MIN_HISTORY_FACTOR,
++	CPU_SCHED_SLEEP_FACTOR
++};
++
++#define minslice	1
++#define maxslice	100
++
++#define minfactor	1
++#define maxfactor	30
++
++#define minshift	1
++#define maxshift	40
++
++#define minsleepfactor	1
++#define maxsleepfactor	2048
++
++ctl_table cpu_sched_table[] = {
++	{
++		.ctl_name	= CPU_SCHED_RT_TIMESLICE,
++		.procname	= "rt_timeslice",
++		.data		= &rt_timeslice,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec_minmax,
++		.extra1		= (void *)minslice,
++		.extra2		= (void *)maxslice
++	},
++	{
++		.ctl_name	= CPU_SCHED_BASE_TIMESLICE,
++		.procname	= "base_timeslice",
++		.data		= &base_timeslice,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec_minmax,
++		.extra1		= (void *)minslice,
++		.extra2		= (void *)maxslice
++	},
++	{
++		.ctl_name	= CPU_SCHED_MAX_SLEEP_SHIFT,
++		.procname	= "max_sleep_shift",
++		.data		= &max_sleep_shift,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec_minmax,
++		.extra1		= (void *)minshift,
++		.extra2		= (void *)maxshift
++	},
++	{
++		.ctl_name	= CPU_SCHED_MAX_SLEEP_AFFECT_FACTOR,
++		.procname	= "max_sleep_affect_factor",
++		.data		= &max_sleep_affect_factor,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec_minmax,
++		.extra1		= (void *)minfactor,
++		.extra2		= (void *)maxfactor
++	},
++	{
++		.ctl_name	= CPU_SCHED_MAX_RUN_AFFECT_FACTOR,
++		.procname	= "max_run_affect_factor",
++		.data		= &max_run_affect_factor,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec_minmax,
++		.extra1		= (void *)minfactor,
++		.extra2		= (void *)maxfactor
++	},
++	{
++		.ctl_name	= CPU_SCHED_MAX_WAIT_AFFECT_FACTOR,
++		.procname	= "max_wait_affect_factor",
++		.data		= &max_wait_affect_factor,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec_minmax,
++		.extra1		= (void *)minfactor,
++		.extra2		= (void *)maxfactor
++	},
++	{
++		.ctl_name	= CPU_SCHED_MIN_HISTORY_FACTOR,
++		.procname	= "min_history_factor",
++		.data		= &min_history_factor,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec_minmax,
++		.extra1		= (void *)minfactor,
++		.extra2		= (void *)maxfactor
++	},
++	{
++		.ctl_name	= CPU_SCHED_SLEEP_FACTOR,
++		.procname	= "sleep_factor",
++		.data		= &sleep_factor,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec_minmax,
++		.extra1		= (void *)minsleepfactor,
++		.extra2		= (void *)maxsleepfactor
++	},
++	{ .ctl_name = CPU_SCHED_END_OF_LIST }
++};
++
++#endif
+only in patch2:
+unchanged:
+--- linux-xsched/include/linux/sysctl.h~xsched-tunables	2004-07-10 23:33:57.000000000 -0400
++++ linux-xsched-xiphux/include/linux/sysctl.h	2004-07-10 23:33:57.000000000 -0400
+@@ -133,6 +133,7 @@ enum
+ 	KERN_NGROUPS_MAX=63,	/* int: NGROUPS_MAX */
+ 	KERN_SPARC_SCONS_PWROFF=64, /* int: serial console power-off halt */
+ 	KERN_HZ_TIMER=65,	/* int: hz timer on or off */
++	KERN_CPU_SCHED=66,
+ };
+ 
+ 
+only in patch2:
+unchanged:
+--- linux-xsched/kernel/sysctl.c~xsched-tunables	2004-07-10 23:33:57.000000000 -0400
++++ linux-xsched-xiphux/kernel/sysctl.c	2004-07-10 23:33:57.000000000 -0400
+@@ -142,6 +142,7 @@ extern ctl_table random_table[];
+ #ifdef CONFIG_UNIX98_PTYS
+ extern ctl_table pty_table[];
+ #endif
++extern ctl_table cpu_sched_table[];
+ 
+ /* /proc declarations: */
+ 
+@@ -620,6 +621,12 @@ static ctl_table kern_table[] = {
+ 		.mode		= 0444,
+ 		.proc_handler	= &proc_dointvec,
+ 	},
++	{
++		.ctl_name	= KERN_CPU_SCHED,
++		.procname	= "cpusched",
++		.mode		= 0555,
++		.child		= cpu_sched_table,
++	},
+ 	{ .ctl_name = 0 }
+ };
+ 

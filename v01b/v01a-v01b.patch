@@ -1,0 +1,102 @@
+diff -u linux-xsched-xiphux/kernel/sched.c linux-xsched-xiphux/kernel/sched.c
+--- linux-xsched-xiphux/kernel/sched.c	2004-07-08 05:52:16.697085216 -0400
++++ linux-xsched-xiphux/kernel/sched.c	2004-07-10 06:29:49.192947752 -0400
+@@ -238,7 +238,7 @@
+ 	spin_unlock_irq(&rq->lock);
+ }
+ 
+-static inline int preemption_warranted(const struct task_struct *p, runqueue_t *rq)
++static inline int task_preempts_curr(const struct task_struct *p, runqueue_t *rq)
+ {
+ 	if (p->prio < rq->current_prio_slot->prio) {
+ 		if (rt_task(p) || rq->cache_ticks >= cache_decay_ticks ||
+@@ -374,6 +374,12 @@
+ 	delta = p->static_prio - idx;
+ 	timeslice = base * 2 / (delta + 2);
+ 
++	/*
++	 * Kernel threads should get an extra bonus.
++	 */
++	if (p->mm == NULL)
++		timeslice = (2 * timeslice * MAX_TIMESLICE) / (timeslice + MAX_TIMESLICE);
++
+ 	if (timeslice < MIN_TIMESLICE)
+ 		timeslice = MIN_TIMESLICE;
+ 
+@@ -775,7 +781,7 @@
+ 
+ 	activate_task(p, rq, cpu == this_cpu);
+ 	if (!sync || cpu != this_cpu) {
+-		if (preemption_warranted(p, rq))
++		if (task_preempts_curr(p, rq))
+ 			resched_task(rq->curr);
+ 	}
+ 	success = 1;
+@@ -903,7 +909,7 @@
+ 		p->timestamp = (p->timestamp - this_rq->timestamp_last_tick)
+ 					+ rq->timestamp_last_tick;
+ 		__activate_task(p, rq);
+-		if (preemption_warranted(p, rq))
++		if (task_preempts_curr(p, rq))
+ 			resched_task(rq->curr);
+ 
+ 	}
+@@ -1231,7 +1237,7 @@
+ 	 * Note that idle threads have a prio of MAX_PRIO, for this test
+ 	 * to be always true for them.
+ 	 */
+-	if (preemption_warranted(p, this_rq))
++	if (task_preempts_curr(p, this_rq))
+ 		resched_task(this_rq->curr);
+ }
+ 
+@@ -1901,6 +1907,15 @@
+ 
+ 	spin_lock_irq(&rq->lock);
+ 
++	if (unlikely(!task_timeslice(prev, rq))) {
++		dequeue_task(prev);
++		prev->prio = task_priority(prev);
++		set_tsk_need_resched(prev);
++		rq->current_prio_slot = rq->queues + task_priority(p);
++		enqueue_task(p, rq, rq->current_prio_slot->prio);
++		update_min_prio(p, rq);
++	}
++
+ 	/*
+ 	 * if entering off of a kernel preemption go straight
+ 	 * to picking the next task.
+@@ -2415,13 +2430,13 @@
+ 	retval = 0;
+ 	__setscheduler(p, policy, lp.sched_priority);
+ 	if (queued) {
+-		__activate_task(p, task_rq(p));
++		__activate_task(p, rq);
+ 		/*
+ 		 * Reschedule if we are currently running on this runqueue and
+ 		 * our priority decreased, or if we are not currently running on
+ 		 * this runqueue and our priority is higher than the current's
+ 		 */
+-		if (preemption_warranted(p, rq))
++		if (task_preempts_curr(p, rq))
+ 			resched_task(rq->curr);
+ 		if (task_running(rq, p))
+ 			rq->current_prio_slot = rq->queues + p->prio;
+@@ -3053,7 +3068,7 @@
+ 		 */
+ 		set_task_cpu(p, dest_cpu);
+ 		activate_task(p, rq_dest, 0);
+-		if (preemption_warranted(p, rq_dest))
++		if (task_preempts_curr(p, rq_dest))
+ 			resched_task(rq_dest->curr);
+ 	} else
+ 		set_task_cpu(p, dest_cpu);
+@@ -3615,7 +3630,7 @@
+ 		bitmap_zero(rq->bitmap, NUM_PRIO_SLOTS);
+ 		// delimiter for bitsearch
+ 		__set_bit(MAX_PRIO, rq->bitmap);
+-		rq->current_prio_slot = rq->queues + (MAX_PRIO - 20);
++		rq->current_prio_slot = rq->queues + (MAX_PRIO - 29);
+ 	}
+ 
+ 	/*

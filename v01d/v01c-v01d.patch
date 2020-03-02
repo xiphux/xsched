@@ -1,0 +1,201 @@
+diff -u linux-xsched-xiphux/kernel/sched.c linux-xsched-xiphux/kernel/sched.c
+--- linux-xsched-xiphux/kernel/sched.c	2004-07-11 07:21:40.842353512 -0400
++++ linux-xsched-xiphux/kernel/sched.c	2004-07-11 00:15:05.349371208 -0400
+@@ -86,7 +86,7 @@
+ 
+ #define MIN_TIMESLICE		(8 * HZ / 1000 ?: 1)
+ 
+-#define MAX_TIMESLICE		(base_timeslice * (MAX_USER_PRIO + 1) / 3 * 2)
++#define MAX_TIMESLICE		((base_timeslice * (MAX_USER_PRIO + 1) / 3) << 1)
+ 
+ /* Maximum amount of history that will be used to calculate priority */
+ #ifdef CONFIG_SYSCTL
+@@ -371,11 +371,11 @@
+ 		time = max_affect;
+ 
+ 	ratio = MAX_SLEEP - time;
+-	tmp = (unsigned long long)ratio*p->total_time + MAX_SLEEP/2;
++	tmp = (unsigned long long)ratio*p->total_time + (MAX_SLEEP >> 1);
+ 	tmp >>= max_sleep_shift;
+ 	p->total_time = (unsigned long)tmp;
+ 
+-	tmp = (unsigned long long)ratio*p->sleep_time + MAX_SLEEP/2;
++	tmp = (unsigned long long)ratio*p->sleep_time + (MAX_SLEEP >> 1);
+ 	tmp >>= max_sleep_shift;
+ 	p->sleep_time = (unsigned long)tmp;
+ 
+@@ -415,7 +415,7 @@
+ 
+ 	idx = min(rq->min_nice, p->static_prio);
+ 	delta = p->static_prio - idx;
+-	timeslice = base * 2 / (delta + 2);
++	timeslice = (base << 1) / (delta + 2);
+ 
+ 	timeslice = timeslice * 30 / (60 - USER_PRIO(idx));
+ 
+@@ -423,8 +423,12 @@
+ 	/*
+ 	 * Kernel threads should get an extra bonus.
+ 	 */
+-	if (p->mm == NULL)
+-		timeslice = (2 * timeslice * MAX_TIMESLICE) / (timeslice + MAX_TIMESLICE);
++	if (p->mm == NULL) {
++		idx = timeslice + MAX_TIMESLICE;
++		timeslice *= MAX_TIMESLICE;
++		timeslice <<= 1;
++		timeslice = timeslice / idx;
++	}
+ 
+ 	if (timeslice < MIN_TIMESLICE)
+ 		timeslice = MIN_TIMESLICE;
+@@ -444,7 +448,7 @@
+ 	if (rt_task(p))
+ 		return p->prio;
+ 
+-	bonus = ((MAX_USER_PRIO / 3) * p->sleep_avg + (sleep_factor / 2)) / sleep_factor;
++	bonus = ((MAX_USER_PRIO / 3) * p->sleep_avg + (sleep_factor >> 1)) / sleep_factor;
+ 	prio = USER_PRIO(p->static_prio) + 20;
+ 
+ 	prio = MAX_RT_PRIO + prio - bonus;
+@@ -772,7 +776,7 @@
+ 		this_load -= SCHED_LOAD_SCALE;
+ 
+ 	/* Don't pull the task off an idle CPU to a busy one */
+-	if (load < SCHED_LOAD_SCALE/2 && this_load > SCHED_LOAD_SCALE/2)
++	if (load < (SCHED_LOAD_SCALE >> 1) && this_load > (SCHED_LOAD_SCALE >> 1))
+ 		goto out_set_cpu;
+ 
+ 	new_cpu = this_cpu; /* Wake to this CPU if we can */
+@@ -787,7 +791,7 @@
+ 		 * Start passive balancing when half the imbalance_pct
+ 		 * limit is reached.
+ 		 */
+-		imbalance = sd->imbalance_pct + (sd->imbalance_pct - 100) / 2;
++		imbalance = sd->imbalance_pct + ((sd->imbalance_pct - 100) >> 1);
+ 
+ 		if ( ((sd->flags & SD_WAKE_AFFINE) &&
+ 				!task_hot(p, rq->timestamp_last_tick, sd))
+@@ -885,8 +889,8 @@
+ 	/*
+ 	 * Get only 1/4th of the parents history. Limited by MIN_HISTORY.
+ 	 */
+-	p->total_time = current->total_time / 4;
+-	p->sleep_time = current->sleep_time / 4;
++	p->total_time = (current->total_time >> 2);
++	p->sleep_time = (current->sleep_time >> 2);
+ 	p->sleep_avg = current->sleep_avg;
+ 	if (p->total_time < MIN_HISTORY) {
+ 		p->total_time = MIN_HISTORY;
+@@ -896,7 +900,7 @@
+ 	/*
+ 	 * Lose 1/4 sleep_time for forking.
+ 	 */
+-	current->sleep_time = 3 * current->sleep_time / 4;
++	current->sleep_time = 3 * (current->sleep_time >> 2);
+ 	if (likely(current->total_time != 0)) {
+ 		current->sleep_avg = (sleep_factor * current->sleep_time)
+ 			/ current->total_time;
+@@ -1194,7 +1198,7 @@
+ 	 * Use half of the balancing threshold - new-context is
+ 	 * a good opportunity to balance.
+ 	 */
+-	if (min_load*(100 + (sd->imbalance_pct-100)/2) < this_load*100)
++	if (min_load*(100 + ((sd->imbalance_pct-100) >> 1)) < this_load*100)
+ 		return min_cpu;
+ 
+ 	return this_cpu;
+@@ -1461,7 +1465,7 @@
+ 		unsigned long pwr_now = 0, pwr_move = 0;
+ 		unsigned long tmp;
+ 
+-		if (max_load - this_load >= SCHED_LOAD_SCALE*2) {
++		if (max_load - this_load >= (SCHED_LOAD_SCALE << 1)) {
+ 			*imbalance = 1;
+ 			return busiest;
+ 		}
+@@ -1490,7 +1494,7 @@
+ 		pwr_move /= SCHED_LOAD_SCALE;
+ 
+ 		/* Move if we gain another 8th of a CPU worth of throughput */
+-		if (pwr_move < pwr_now + SCHED_LOAD_SCALE / 8)
++		if (pwr_move < pwr_now + (SCHED_LOAD_SCALE >> 3))
+ 			goto out_balanced;
+ 
+ 		*imbalance = 1;
+@@ -1619,7 +1623,7 @@
+ 
+ 	/* tune up the balancing interval */
+ 	if (sd->balance_interval < sd->max_interval)
+-		sd->balance_interval *= 2;
++		sd->balance_interval <<= 1;
+ 
+ 	return 0;
+ }
+@@ -1773,7 +1777,7 @@
+ 	 */
+ 	if (this_load > old_load)
+ 		old_load++;
+-	this_rq->cpu_load = (old_load + this_load) / 2;
++	this_rq->cpu_load = ((old_load + this_load) >> 1);
+ 
+ 	for_each_domain(this_cpu, sd) {
+ 		unsigned long interval = sd->balance_interval;
+@@ -1866,8 +1870,6 @@
+ 
+ 	/*
+ 	 * SCHED_FIFO tasks never run out of timeslice.
+-	 * and should not be burdened with the overhead of promotion or
+-	 * a tick rebalance
+ 	 */
+ 	if (unlikely(p->policy == SCHED_FIFO))
+ 		goto out;
+@@ -1879,7 +1881,6 @@
+ 	 * priority until it either goes to sleep or uses up its
+ 	 * timeslice.
+ 	 */
+-#if 0
+ 	if (unlikely(p->policy == SCHED_RR)) {
+ 		/*
+ 		 * RR tasks need a special form of timeslice management.
+@@ -1894,7 +1895,6 @@
+ 		}
+ 		goto out_unlock;
+ 	}
+-#endif
+ 	if (task_timeslice(p, rq) <= 1) {
+ 		dequeue_task(p);
+ 		set_tsk_need_resched(p);
+@@ -1973,12 +1973,19 @@
+ 	}
+ 
+ 	if (unlikely(!task_timeslice(prev, rq))) {
+-		dequeue_task(prev);
+-		prev->prio = task_priority(prev);
+ 		set_tsk_need_resched(prev);
+-		rq->current_prio_slot = rq->queues + task_priority(p);
+-		enqueue_task(p, rq, rq->current_prio_slot->prio);
+-		update_min_prio(p, rq);
++		if (rt_task(prev)) {
++			if (prev->policy == SCHED_RR) {
++				list_del_init(&prev->run_list);
++				list_add_tail(&prev->run_list, &rq->current_prio_slot->queue);
++			}
++		} else {
++			dequeue_task(prev);
++			prev->prio = task_priority(prev);
++			rq->current_prio_slot = rq->queues + task_priority(p);
++			enqueue_task(p, rq, rq->current_prio_slot->prio);
++			update_min_prio(p, rq);
++		}
+ 	}
+ 
+ no_check_expired:
+@@ -2161,7 +2168,7 @@
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&x->wait.lock, flags);
+-	x->done += UINT_MAX/2;
++	x->done += (UINT_MAX >> 1);
+ 	__wake_up_common(&x->wait, TASK_UNINTERRUPTIBLE | TASK_INTERRUPTIBLE,
+ 			 0, 0, NULL);
+ 	spin_unlock_irqrestore(&x->wait.lock, flags);

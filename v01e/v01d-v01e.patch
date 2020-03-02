@@ -1,0 +1,960 @@
+diff -u linux-xsched-xiphux/include/linux/sched.h linux-xsched-xiphux/include/linux/sched.h
+--- linux-xsched-xiphux/include/linux/sched.h	2004-07-09 01:23:49.701780424 -0400
++++ linux-xsched-xiphux/include/linux/sched.h	2004-07-12 20:02:59.777110576 -0400
+@@ -418,6 +418,13 @@
+ 	unsigned long total_time, sleep_time;
+ 	unsigned long sleep_avg;
+ 
++	unsigned long long sched_timestamp;
++	unsigned long long avg_sleep_per_cycle;
++	unsigned long long avg_delay_per_cycle, avg_delay_per_sub_cycle;
++	unsigned long long avg_cpu_per_cycle, avg_cpu_per_sub_cycle;
++	unsigned long long interactive_bonus, throughput_bonus, sub_cycle_count;
++	unsigned long long sleepiness, cpu_usage_rate;
++
+ 	unsigned long policy;
+ 	cpumask_t cpus_allowed;
+ 	unsigned int time_slice;
+@@ -568,6 +575,8 @@
+ #define PF_SWAPOFF	0x00080000	/* I am in swapoff */
+ #define PF_LESS_THROTTLE 0x00100000	/* Throttle me less: I clean memory */
+ #define PF_SYNCWRITE	0x00200000	/* I am doing a sync write */
++#define PF_FORKED	0x00400000	/* I have just forked */
++#define PF_YIELDED	0x00800000	/* I have just yielded */
+ 
+ #ifdef CONFIG_SMP
+ #define SCHED_LOAD_SCALE	128UL	/* increase resolution of load */
+diff -u linux-xsched-xiphux/kernel/sched.c linux-xsched-xiphux/kernel/sched.c
+--- linux-xsched-xiphux/kernel/sched.c	2004-07-11 00:15:05.349371208 -0400
++++ linux-xsched-xiphux/kernel/sched.c	2004-07-13 01:40:56.889681736 -0400
+@@ -16,6 +16,14 @@
+  *		by Davide Libenzi, preemptible kernel bits by Robert Love.
+  *  2003-09-03	Interactivity tuning by Con Kolivas.
+  *  2004-04-02	Scheduler domains code by Nick Piggin
++ *  2004-07-12	Xsched scheduling policy by xiphux.  Thanks go to:
++ *  		- Peter William's SPA scheduler for the basic single
++ *  		  array prio-slot structure, as well as the interactivity
++ *  		  and throughput bonus algorithms.
++ *  		- Nick Piggin's Nicksched for the dynamic priority/timeslice
++ *  		  system based on task sleep time.
++ *  		- Con Kolivas's Staircase scheduler for the interactive and
++ *  		  compute sysctls as well as the forked/yielded process flags.
+  */
+ 
+ #include <linux/mm.h>
+@@ -45,6 +53,18 @@
+ 
+ #include <asm/unistd.h>
+ 
++#ifdef CONFIG_SYSCTL
++static unsigned int sched_interactive = 1;
++#else
++#define sched_interactive	1
++#endif
++
++#ifdef CONFIG_SYSCTL
++static unsigned int sched_compute = 0;
++#else
++#define sched_compute	0
++#endif
++
+ /*
+  * Convert user-nice values [ -20 ... 0 ... 19 ]
+  * to static priority [ MAX_RT_PRIO..MAX_PRIO-1 ],
+@@ -151,6 +171,135 @@
+ #define STIME_RUN		2	/* Using CPU */
+ #define STIME_WAIT		3	/* Waiting for CPU */
+ 
++/*
++ * Making MAX_TOTAL_BONUS bigger than 19 causes mysterious crashes during boot
++ * this causes the number of longs in the bitmap to increase from 5 to 6
++ * and that's a limit on bit map size P.W.
++ */
++#define MAX_TOTAL_BONUS 19
++#define MAX_MAX_IA_BONUS 10
++#define MAX_MAX_TPT_BONUS (MAX_TOTAL_BONUS - MAX_MAX_IA_BONUS)
++#define DEFAULT_MAX_IA_BONUS MAX_MAX_IA_BONUS
++#define DEFAULT_MAX_TPT_BONUS ((DEFAULT_MAX_IA_BONUS) / 2)
++static unsigned int max_ia_bonus = DEFAULT_MAX_IA_BONUS;
++static unsigned int initial_ia_bonus = 1;
++static unsigned int max_tpt_bonus = DEFAULT_MAX_TPT_BONUS;
++
++/*
++ * Define some mini Kalman filter for estimating various averages, etc.
++ * To make it more efficient the denominator of the fixed point rational
++ * numbers used to store the averages and the response half life will
++ * be chosen so that the fixed point rational number reperesentation
++ * of (1 - alpha) * i (where i is an integer) will be i.
++ * Some of this is defined in linux/sched.h
++ */
++/*
++ * Fixed denominator rational numbers for use by the CPU scheduler
++ */
++#define SCHED_AVG_OFFSET 4
++/*
++ * Get the rounded integer value of a scheduling statistic average field
++ * i.e. those fields whose names begin with avg_
++ */
++#define SCHED_AVG_RND(x) \
++	(((x) + (1 << (SCHED_AVG_OFFSET - 1))) >> (SCHED_AVG_OFFSET))
++#define SCHED_AVG_ALPHA ((1 << SCHED_AVG_OFFSET) - 1)
++#define SCHED_AVG_MUL(a, b) (((a) * (b)) >> SCHED_AVG_OFFSET)
++#define SCHED_AVG_REAL(a) ((a) << SCHED_AVG_OFFSET)
++#define SCHED_IA_BONUS_OFFSET 8
++#define SCHED_IA_BONUS_ALPHA ((1 << SCHED_IA_BONUS_OFFSET) - 1)
++#define SCHED_IA_BONUS_MUL(a, b) (((a) * (b)) >> SCHED_IA_BONUS_OFFSET)
++/*
++ * Get the rounded integer value of the interactive bonus
++ */
++#define SCHED_IA_BONUS_RND(x) \
++	(((x) + (1 << (SCHED_IA_BONUS_OFFSET - 1))) >> (SCHED_IA_BONUS_OFFSET))
++
++static inline void apply_sched_avg_decay(unsigned long long *valp)
++{
++	*valp = SCHED_AVG_MUL(*valp, SCHED_AVG_ALPHA);
++}
++
++static inline void update_sched_ia_bonus(struct task_struct *p, unsigned long long incr)
++{
++	p->interactive_bonus = SCHED_IA_BONUS_MUL(p->interactive_bonus, SCHED_IA_BONUS_ALPHA);
++	p->interactive_bonus += incr;
++}
++
++static inline unsigned long long sched_div_64(unsigned long long a, unsigned long long b)
++{
++#if BITS_PER_LONG < 64
++	/*
++	 * Assume that there's no 64 bit divide available
++	 */
++	if (a < b)
++		return 0;
++	/*
++	 * Scale down until b less than 32 bits so that we can do
++	 * a divide using do_div()
++	 */
++	while (b > ULONG_MAX) { a >>= 1; b >>= 1; }
++
++	(void)do_div(a, (unsigned long)b);
++
++	return a;
++#else
++	return a / b;
++#endif
++}
++
++#define PROPORTION_OFFSET 32
++#define PROPORTION_ONE ((unsigned long long)1 << PROPORTION_OFFSET)
++#define PROPORTION_OVERFLOW (((unsigned long long)1 << (64 - PROPORTION_OFFSET)) - 1)
++#define PROP_FM_PPT(a) (((unsigned long long)(a) * PROPORTION_ONE) / 1000)
++/*
++ * Convert a / b to a proportion in the range 0 to PROPORTION_ONE
++ * Requires a <= b or may get a divide by zero exception
++ */
++static inline unsigned long long calc_proportion(unsigned long long a, unsigned long long b)
++{
++	if (unlikely(a == b))
++		return PROPORTION_ONE;
++
++	while (a > PROPORTION_OVERFLOW) { a >>= 1; b >>= 1; }
++
++	return sched_div_64(a << PROPORTION_OFFSET, b);
++}
++
++/*
++ * Map the given proportion to an unsigned long long in the specified range
++ * Requires range < PROPORTION_ONE to avoid overflow
++ */
++static inline unsigned long long map_proportion(unsigned long long prop, unsigned long long range)
++{
++	return (prop * range) >> PROPORTION_OFFSET;
++}
++
++static inline unsigned long long map_proportion_rnd(unsigned long long prop, unsigned long long range)
++{
++	return map_proportion((prop >> 1), (range * 2 + 1));
++}
++
++/*
++ * Tasks that have a CPU usage rate greater than this threshold (in parts per
++ * hundred) are considered to be CPU bound and start to lose interactive bonus
++ * points
++ */
++#define DEFAULT_CPU_HOG_THRESHOLD 900
++static unsigned int cpu_hog_threshold_ppt = DEFAULT_CPU_HOG_THRESHOLD;
++static unsigned long long cpu_hog_threshold = PROP_FM_PPT(DEFAULT_CPU_HOG_THRESHOLD);
++
++/*
++ * Tasks that would sleep for more than 900 parts per thousand of the time if
++ * they had the CPU to themselves are considered to be interactive provided
++ * that their average sleep duration per scheduling cycle isn't too long
++ */
++#define DEFAULT_IA_THRESHOLD 900
++static unsigned int ia_threshold_ppt = DEFAULT_IA_THRESHOLD;
++static unsigned long long ia_threshold = PROP_FM_PPT(DEFAULT_IA_THRESHOLD);
++#define LOWER_MAX_IA_SLEEP SCHED_AVG_REAL(15 * 60LL * NSEC_PER_SEC)
++#define UPPER_MAX_IA_SLEEP SCHED_AVG_REAL(2 * 60 * 60LL * NSEC_PER_SEC)
++
+ #define task_hot(p, now, sd) ((now) - (p)->timestamp < (sd)->cache_hot_time)
+ 
+ /*
+@@ -285,7 +434,7 @@
+ {
+ 	if (p->prio < rq->current_prio_slot->prio) {
+ 		if (rt_task(p) || rq->cache_ticks >= cache_decay_ticks ||
+-			!p->mm || rq->curr == rq->idle)
++			!p->mm || rq->curr == rq->idle || !sched_compute)
+ 				return 1;
+ 		rq->preempted = 1;
+ 	}
+@@ -308,6 +457,144 @@
+ 	}
+ }
+ 
++static int hog_sub_cycle_threshold = 10;
++
++/*
++ * Check whether a task qualifies for a throughput bonus and if it does
++ * give it one
++ * This never gets called on real time tasks
++ */
++static void recalc_throughput_bonus(task_t *p, unsigned long long load)
++{
++	if (unlikely(p->sub_cycle_count > hog_sub_cycle_threshold)) {
++		/*
++		 * No delay means no bonus, but
++		 * NB this test also avoids a possible divide by zero error if
++		 * cpu is also zero
++		 */
++		if (p->avg_delay_per_sub_cycle == 0) {
++			p->throughput_bonus = 0;
++			return;
++		}
++		p->throughput_bonus = calc_proportion(p->avg_delay_per_sub_cycle,
++			p->avg_delay_per_sub_cycle + load * p->avg_cpu_per_sub_cycle);
++		return;
++	}
++	/*
++	 * No delay means no bonus, but
++	 * NB this test also avoids a possible divide by zero error if
++	 * cpu is also zero
++	 */
++	if (p->avg_delay_per_cycle == 0) {
++		p->throughput_bonus = 0;
++		return;
++	}
++	p->throughput_bonus = calc_proportion(p->avg_delay_per_cycle,
++		p->avg_delay_per_cycle + load * p->avg_cpu_per_cycle);
++}
++
++/*
++ * Calculate CPU usage rate and sleepiness.
++ * This never gets called on real time tasks
++ */
++static void calculate_rates(task_t *p)
++{
++	unsigned long long bl = p->avg_sleep_per_cycle + p->avg_cpu_per_cycle;
++
++	/*
++	 * Take a shortcut and avoid possible divide by zero later
++	 */
++	if (unlikely(bl == 0)) {
++		p->sleepiness = PROPORTION_ONE;
++		p->cpu_usage_rate = 0;
++	} else {
++		p->sleepiness = calc_proportion(p->avg_sleep_per_cycle, bl);
++		if (unlikely(p->sub_cycle_count > hog_sub_cycle_threshold)) {
++			/*
++			 * Take a shortcut and avoid possible divide by zero later
++			 */
++			if (p->avg_delay_per_sub_cycle == 0)
++				p->cpu_usage_rate = PROPORTION_ONE;
++			else {
++				unsigned long long sbl;
++
++				sbl = p->avg_delay_per_sub_cycle + p->avg_cpu_per_sub_cycle;
++				p->cpu_usage_rate = calc_proportion(p->avg_cpu_per_sub_cycle, sbl);
++			}
++		} else {
++			bl += p->avg_delay_per_cycle;
++			p->cpu_usage_rate = calc_proportion(p->avg_cpu_per_cycle, bl);
++		}
++	}
++}
++
++/*
++ * Update various statistics for the end of a
++ * ((on_run_queue :-> on_cpu)* :-> sleep) cycle.
++ * We can't just do this in activate_task() as every invocation of that
++ * function is not the genuine end of a cycle.
++ */
++static void update_stats_for_cycle(task_t *p, const runqueue_t *rq)
++{
++	apply_sched_avg_decay(&p->avg_delay_per_cycle);
++	apply_sched_avg_decay(&p->avg_cpu_per_cycle);
++	p->avg_sleep_per_cycle += (rq->timestamp_last_tick - p->sched_timestamp);
++	/*
++	 * Do this second so that averages for all measures are for
++	 * the current cycle
++	 */
++	apply_sched_avg_decay(&p->avg_sleep_per_cycle);
++	p->sched_timestamp = rq->timestamp_last_tick;
++	p->sub_cycle_count = 0;
++	if (!rt_task(p)) {
++		/* we con't care about these for real time tasks */
++		apply_sched_avg_decay(&p->avg_delay_per_sub_cycle);
++		apply_sched_avg_decay(&p->avg_cpu_per_sub_cycle);
++		calculate_rates(p);
++	}
++}
++
++/*
++ * Check whether a task with an interactive bonus still qualifies and if not
++ * decrease its bonus
++ * This never gets called on real time tasks
++ */
++static void reassess_cpu_boundness(task_t *p)
++{
++	/*
++	 * No point going any further if there's no bonus to lose
++	 */
++	if (p->interactive_bonus == 0)
++		return;
++
++	if (p->cpu_usage_rate > cpu_hog_threshold)
++		update_sched_ia_bonus(p, 0);
++}
++
++/*
++ * Check whether a task qualifies for an interactive bonus and if it does
++ * increase its bonus
++ * This never gets called on real time tasks
++ */
++static void reassess_interactiveness(task_t *p)
++{
++	/*
++	 * No sleep means not interactive (in most cases), but
++	 */
++	if (p->avg_sleep_per_cycle > LOWER_MAX_IA_SLEEP) {
++		/*
++		 * Really long sleeps mean it's probably not interactive
++		 */
++		if (p->avg_sleep_per_cycle > UPPER_MAX_IA_SLEEP)
++			update_sched_ia_bonus(p, 0);
++		return;
++	}
++	if (p->sleepiness > ia_threshold)
++		update_sched_ia_bonus(p, p->sleepiness);
++	else if (p->sub_cycle_count == 0)
++		reassess_cpu_boundness(p);
++}
++
+ /*
+  * Adding/removing a task to/from a runqueue:
+  */
+@@ -405,6 +692,7 @@
+ {
+ 	int idx, base, delta;
+ 	unsigned int timeslice;
++	unsigned int bonus_factor, miabl, mtpbl, max;
+ 
+ 	if (rt_task(p))
+ 		return rt_timeslice;
+@@ -424,12 +712,26 @@
+ 	 * Kernel threads should get an extra bonus.
+ 	 */
+ 	if (p->mm == NULL) {
+-		idx = timeslice + MAX_TIMESLICE;
+-		timeslice *= MAX_TIMESLICE;
++		idx = timeslice + rt_timeslice;
++		timeslice *= rt_timeslice;
+ 		timeslice <<= 1;
+ 		timeslice = timeslice / idx;
++	} else if (sched_compute) {
++		timeslice <<= 3;
++	} else if (sched_interactive) {
++		miabl = max_ia_bonus;
++		mtpbl = max_tpt_bonus;
++		bonus_factor = (miabl + mtpbl);
++		max = bonus_factor;
++		bonus_factor -= map_proportion_rnd(SCHED_IA_BONUS_RND(p->interactive_bonus), miabl);
++		bonus_factor -= map_proportion_rnd(p->throughput_bonus, mtpbl);
++		if (bonus_factor > 0)
++			timeslice += (((max - bonus_factor) / (max)) *
++				(rt_timeslice - timeslice));
+ 	}
+ 
++	if (timeslice > rt_timeslice)
++		timeslice = ((timeslice + rt_timeslice) >> 1);
+ 	if (timeslice < MIN_TIMESLICE)
+ 		timeslice = MIN_TIMESLICE;
+ 
+@@ -444,6 +746,7 @@
+ static int task_priority(task_t *p)
+ {
+  	int bonus, prio;
++	unsigned int bonus_factor, miabl, mtpbl;
+ 
+ 	if (rt_task(p))
+ 		return p->prio;
+@@ -453,6 +756,15 @@
+ 
+ 	prio = MAX_RT_PRIO + prio - bonus;
+ 
++	if ((p->mm != NULL) && sched_interactive && !sched_compute) {
++		miabl = max_ia_bonus;
++		mtpbl = max_tpt_bonus;
++		bonus_factor = (miabl + mtpbl);
++		bonus_factor -= map_proportion_rnd(SCHED_IA_BONUS_RND(p->interactive_bonus), miabl);
++		bonus_factor -= map_proportion_rnd(p->throughput_bonus, mtpbl);
++		prio += bonus_factor;
++	}
++
+ 	if (prio < MAX_RT_PRIO)
+ 		prio = MAX_RT_PRIO;
+ 	if (prio > MAX_PRIO-1)
+@@ -515,8 +827,9 @@
+ static void deactivate_task(struct task_struct *p, runqueue_t *rq)
+ {
+ 	rq->nr_running--;
+-	if (p->state == TASK_UNINTERRUPTIBLE)
++	if (p->state == TASK_UNINTERRUPTIBLE) {
+ 		rq->nr_uninterruptible++;
++	}
+ 	dequeue_task(p);
+ }
+ 
+@@ -829,6 +1142,16 @@
+ 	if (old_state == TASK_UNINTERRUPTIBLE)
+ 		rq->nr_uninterruptible--;
+ 
++	/*
++	 * This is the end of one scheduling cycle and the start
++	 * of the next
++	 */
++	update_stats_for_cycle(p, rq);
++	if (!rt_task(p)) {
++		recalc_throughput_bonus(p, rq->nr_running + 1);
++		reassess_interactiveness(p);
++	}
++
+ 	activate_task(p, rq, cpu == this_cpu);
+ 	if (!sync || cpu != this_cpu) {
+ 		if (task_preempts_curr(p, rq))
+@@ -857,6 +1180,30 @@
+ 	return try_to_wake_up(p, state, 0);
+ }
+ 
++/*
++ * Initialize the scheduling statistics counters
++ */
++static inline void initialize_stats(task_t *p)
++{
++	p->avg_sleep_per_cycle = 0;
++	p->avg_delay_per_cycle = 0;
++	p->avg_delay_per_sub_cycle = 0;
++	p->avg_cpu_per_cycle = 0;
++	p->avg_cpu_per_sub_cycle = 0;
++	p->sched_timestamp = 0 /* set this to current time later */;
++}
++
++/*
++ * Initialize the scheduling bonuses
++ */
++static inline void initialize_bonuses(task_t *p)
++{
++	p->interactive_bonus = (max_ia_bonus >= initial_ia_bonus) ?
++				initial_ia_bonus : max_ia_bonus;
++	p->throughput_bonus =  0;
++	p->sub_cycle_count = 0;
++}
++
+ #ifdef CONFIG_SMP
+ static int find_idlest_cpu(const struct task_struct *p, int this_cpu,
+ 			   struct sched_domain *sd);
+@@ -905,6 +1252,7 @@
+ 		current->sleep_avg = (sleep_factor * current->sleep_time)
+ 			/ current->total_time;
+ 	}
++	current->flags |= PF_FORKED;
+ }
+ 
+ /*
+@@ -929,6 +1277,16 @@
+ 
+ 	p->prio = task_priority(p);
+ 
++	/*
++	 * Initialize the scheduling statistics and bonus counters
++	 */
++	initialize_stats(p);
++	initialize_bonuses(p);
++	/*
++	 * Scheduling statistics compilation starts now
++	 */
++	p->sched_timestamp = rq->timestamp_last_tick;
++
+ 	if (likely(cpu == this_cpu)) {
+ 		if (!(clone_flags & CLONE_VM)) {
+ 		 	/*
+@@ -1276,10 +1634,16 @@
+ void pull_task(runqueue_t *src_rq, task_t *p,
+ 		runqueue_t *this_rq, int this_cpu, int prio)
+ {
++	unsigned long long delta;
++
+ 	dequeue_task(p);
+ 	src_rq->nr_running--;
++	delta = (src_rq->timestamp_last_tick - p->sched_timestamp);
++	p->avg_delay_per_cycle += delta;
++	p->avg_delay_per_sub_cycle += delta;
+ 	set_task_cpu(p, this_cpu);
+ 	this_rq->nr_running++;
++	p->sched_timestamp = this_rq->timestamp_last_tick;
+ 	enqueue_task(p, this_rq, prio);
+ 	update_min_prio(p, this_rq);
+ 	p->timestamp = (p->timestamp - src_rq->timestamp_last_tick)
+@@ -1896,8 +2260,31 @@
+ 		goto out_unlock;
+ 	}
+ 	if (task_timeslice(p, rq) <= 1) {
++		unsigned long long delta;
++
+ 		dequeue_task(p);
+ 		set_tsk_need_resched(p);
++
++		if (p->flags & PF_FORKED) {
++			p->flags &= ~PF_FORKED;
++		} else {
++			apply_sched_avg_decay(&p->avg_delay_per_sub_cycle);
++			apply_sched_avg_decay(&p->avg_cpu_per_sub_cycle);
++			delta = (rq->timestamp_last_tick - p->sched_timestamp);
++			p->sub_cycle_count++;
++			p->avg_cpu_per_cycle += delta;
++			p->avg_cpu_per_sub_cycle += delta;
++			p->sched_timestamp = rq->timestamp_last_tick;
++			calculate_rates(p);
++			recalc_throughput_bonus(p, rq->nr_running);
++			reassess_cpu_boundness(p);
++		}
++		/*
++		 * Arguably the interactive bonus should be updated here
++		 * as well.  But depends on whether we wish to encourage
++		 * interactive tasks to maintain a high bonus or CPU bound
++		 * tasks to lose some of there bonus?
++		 */
+ 		rq->current_prio_slot = rq->queues + task_priority(p);
+ 		enqueue_task(p, rq, rq->current_prio_slot->prio);
+ 		update_min_prio(p, rq);
+@@ -1922,6 +2309,7 @@
+ 	unsigned long long now;
+ 	unsigned long run_time = 0;
+ 	int cpu;
++	unsigned long long delta;
+ 
+ 	/*
+ 	 * Test if we are atomic.  Since do_exit() needs to call into
+@@ -1980,11 +2368,28 @@
+ 				list_add_tail(&prev->run_list, &rq->current_prio_slot->queue);
+ 			}
+ 		} else {
++			unsigned long long delta;
+ 			dequeue_task(prev);
++			apply_sched_avg_decay(&prev->avg_delay_per_sub_cycle);
++			apply_sched_avg_decay(&prev->avg_cpu_per_sub_cycle);
++			delta = (rq->timestamp_last_tick - prev->sched_timestamp);
++			prev->sub_cycle_count++;
++			prev->avg_cpu_per_cycle += delta;
++			prev->avg_cpu_per_sub_cycle += delta;
++			prev->sched_timestamp = rq->timestamp_last_tick;
++			calculate_rates(prev);
++			recalc_throughput_bonus(prev, rq->nr_running);
++			reassess_cpu_boundness(prev);
++			/*
++			 * Arguably the interactive bonus should be updated here
++			 * as well.  But depends on whether we wish to encourage
++			 * interactive tasks to maintain a high bonus or CPU bound
++			 * tasks to lose some of there bonus?
++			 */
+ 			prev->prio = task_priority(prev);
+-			rq->current_prio_slot = rq->queues + task_priority(p);
+-			enqueue_task(p, rq, rq->current_prio_slot->prio);
+-			update_min_prio(p, rq);
++			rq->current_prio_slot = rq->queues + task_priority(prev);
++			enqueue_task(prev, rq, rq->current_prio_slot->prio);
++			update_min_prio(prev, rq);
+ 		}
+ 	}
+ 
+@@ -2005,11 +2410,41 @@
+ 	clear_tsk_need_resched(prev);
+ 	RCU_qsctr(task_cpu(prev))++;
+ 
++	/*
++	 * Update estimate of average CPU time used per cycle
++	 */
++	delta = (rq->timestamp_last_tick - prev->sched_timestamp);
++	prev->avg_cpu_per_cycle += delta;
++	prev->avg_cpu_per_sub_cycle += delta;
++	prev->timestamp = prev->sched_timestamp = rq->timestamp_last_tick;
++
++	if (next->flags & PF_YIELDED) {
++		next->flags &= ~PF_YIELDED;
++		if (rt_task(next)) {
++			if (next->policy == SCHED_RR) {
++				list_del_init(&next->run_list);
++				list_add(&next->run_list, &rq->current_prio_slot->queue);
++			}
++		} else {
++			dequeue_task(next);
++			next->prio = task_priority(next);
++			rq->current_prio_slot = rq->queues + task_priority(next);
++			enqueue_task_head(next, rq, rq->current_prio_slot->prio);
++			update_min_prio(next, rq);
++		}
++	}
++
+ 	if (likely(prev != next)) {
+ 		add_task_time(next, now - next->timestamp, STIME_WAIT);
+ 		rq->preempted = 0;
+ 		rq->cache_ticks = 0;
+-		next->timestamp = now;
++		/*
++		 * Update estimate of average delay on run queue per cycle
++		 */
++		delta = (rq->timestamp_last_tick - next->sched_timestamp);
++		next->avg_delay_per_cycle += delta;
++		next->avg_delay_per_sub_cycle += delta;
++		next->timestamp = next->sched_timestamp = rq->timestamp_last_tick;
+ 		rq->nr_switches++;
+ 		rq->curr = next;
+ 		++*switch_count;
+@@ -2725,6 +3160,7 @@
+ 		 * occupant of that queue.
+ 		 */
+ 		dequeue_task(current);
++		current->flags |= PF_YIELDED;
+ 		idx = find_next_bit(rq->bitmap, MAX_PRIO, rq->current_prio_slot->prio);
+ 		if (idx < MAX_PRIO)
+ 			rq->current_prio_slot = rq->queues + idx;
+@@ -2989,6 +3425,14 @@
+ 
+ 	idle->sleep_avg = 0;
+ 	idle->prio = MAX_PRIO;
++	/*
++	 * Initialize scheduling statistics counters as they may provide
++	 * valuable about the CPU e.g. avg_cpu_time_per_cycle for the idle
++	 * task will be an estimate of the average time the CPU is idle
++	 */
++	initialize_stats(idle);
++	initialize_bonuses(idle);
++	idle->sched_timestamp = rq->timestamp_last_tick;
+ 	idle->state = TASK_RUNNING;
+ 	set_task_cpu(idle, cpu);
+ 	/*
+@@ -3112,6 +3556,7 @@
+ 		goto out;
+ 
+ 	if (task_queued(p)) {
++		unsigned long long delta;
+ 		/*
+ 		 * Sync timestamp with rq_dest's before activating.
+ 		 * The same thing could be achieved by doing this step
+@@ -3126,11 +3571,17 @@
+ 		 * dequeue_task() relies on task_cpu() always being accurate.
+ 		 */
+ 		set_task_cpu(p, dest_cpu);
++		delta = (rq_dest->timestamp_last_tick - p->sched_timestamp);
++		p->avg_delay_per_cycle += delta;
++		p->avg_delay_per_sub_cycle += delta;
+ 		activate_task(p, rq_dest, 0);
+ 		if (task_preempts_curr(p, rq_dest))
+ 			resched_task(rq_dest->curr);
+-	} else
++	} else {
+ 		set_task_cpu(p, dest_cpu);
++		p->avg_sleep_per_cycle += (rq_dest->timestamp_last_tick - p->sched_timestamp);
++	}
++	p->sched_timestamp = rq_dest->timestamp_last_tick;
+ 
+ out:
+ 	double_rq_unlock(rq_src, rq_dest);
+@@ -3690,6 +4141,7 @@
+ 		// delimiter for bitsearch
+ 		__set_bit(MAX_PRIO, rq->bitmap);
+ 		rq->current_prio_slot = rq->queues + (MAX_PRIO - 29);
++		rq->timestamp_last_tick = clock_us();
+ 	}
+ 
+ 	/*
+@@ -3698,16 +4150,39 @@
+ enum
+ {
+ 	CPU_SCHED_END_OF_LIST=0,
+-	CPU_SCHED_RT_TIMESLICE=1,
+-	CPU_SCHED_BASE_TIMESLICE,
+-	CPU_SCHED_MAX_SLEEP_SHIFT,
+-	CPU_SCHED_MAX_SLEEP_AFFECT_FACTOR,
+-	CPU_SCHED_MAX_RUN_AFFECT_FACTOR,
+-	CPU_SCHED_MAX_WAIT_AFFECT_FACTOR,
+-	CPU_SCHED_MIN_HISTORY_FACTOR,
+-	CPU_SCHED_SLEEP_FACTOR
++	CPU_NICKSCHED=1,
++	CPU_SPA,
++	CPU_SCHED_INTERACTIVE,
++	CPU_SCHED_COMPUTE
+ };
+ 
++enum
++{
++	CPU_NICKSCHED_END_OF_LIST=0,
++	CPU_NICKSCHED_RT_TIMESLICE=1,
++	CPU_NICKSCHED_BASE_TIMESLICE,
++	CPU_NICKSCHED_MAX_SLEEP_SHIFT,
++	CPU_NICKSCHED_MAX_SLEEP_AFFECT_FACTOR,
++	CPU_NICKSCHED_MAX_RUN_AFFECT_FACTOR,
++	CPU_NICKSCHED_MAX_WAIT_AFFECT_FACTOR,
++	CPU_NICKSCHED_MIN_HISTORY_FACTOR,
++	CPU_NICKSCHED_SLEEP_FACTOR,
++};
++
++enum
++{
++	CPU_SPA_END_OF_LIST=0,
++	CPU_SPA_MAX_IA_BONUS=1,
++	CPU_SPA_MAX_TPT_BONUS,
++	CPU_SPA_IA_THRESHOLD,
++	CPU_SPA_CPU_HOG_THRESHOLD,
++	CPU_SPA_INITIAL_IA_BONUS,
++	CPU_SPA_HOG_SUB_CYCLE_THRESHOLD
++};
++
++static const unsigned int zero = 0;
++static const unsigned int one = 1;
++
+ #define minslice	1
+ #define maxslice	100
+ 
+@@ -3720,9 +4195,40 @@
+ #define minsleepfactor	1
+ #define maxsleepfactor	2048
+ 
+-ctl_table cpu_sched_table[] = {
++#define min_milli_value zero
++static const unsigned int max_milli_value = 1000;
++#define min_max_ia_bonus zero
++static const unsigned int max_max_ia_bonus = MAX_MAX_IA_BONUS;
++#define min_max_tpt_bonus zero
++static const unsigned int max_max_tpt_bonus = MAX_MAX_TPT_BONUS;
++static const unsigned int max_base_prom_interval_msecs = INT_MAX;
++#define max_hog_sub_cycle_threshold max_base_prom_interval_msecs
++
++static int proc_cpu_hog_threshold(ctl_table *ctp, int write, struct file *fp,
++				void __user *buffer, size_t *lenp)
++{
++	int res = proc_dointvec_minmax(ctp, write, fp, buffer, lenp);
++
++	if ((res == 0) && write)
++		cpu_hog_threshold = calc_proportion(cpu_hog_threshold_ppt, 1000);
++
++	return res;
++}
++
++static int proc_ia_threshold(ctl_table *ctp, int write, struct file *fp,
++				void __user *buffer, size_t *lenp)
++{
++	int res = proc_dointvec_minmax(ctp, write, fp, buffer, lenp);
++
++	if ((res == 0) && write)
++		ia_threshold = calc_proportion(ia_threshold_ppt, 1000);
++
++	return res;
++}
++
++ctl_table cpu_nicksched_table[] = {
+ 	{
+-		.ctl_name	= CPU_SCHED_RT_TIMESLICE,
++		.ctl_name	= CPU_NICKSCHED_RT_TIMESLICE,
+ 		.procname	= "rt_timeslice",
+ 		.data		= &rt_timeslice,
+ 		.maxlen		= sizeof(unsigned int),
+@@ -3732,7 +4238,7 @@
+ 		.extra2		= (void *)maxslice
+ 	},
+ 	{
+-		.ctl_name	= CPU_SCHED_BASE_TIMESLICE,
++		.ctl_name	= CPU_NICKSCHED_BASE_TIMESLICE,
+ 		.procname	= "base_timeslice",
+ 		.data		= &base_timeslice,
+ 		.maxlen		= sizeof(unsigned int),
+@@ -3742,7 +4248,7 @@
+ 		.extra2		= (void *)maxslice
+ 	},
+ 	{
+-		.ctl_name	= CPU_SCHED_MAX_SLEEP_SHIFT,
++		.ctl_name	= CPU_NICKSCHED_MAX_SLEEP_SHIFT,
+ 		.procname	= "max_sleep_shift",
+ 		.data		= &max_sleep_shift,
+ 		.maxlen		= sizeof(unsigned int),
+@@ -3752,7 +4258,7 @@
+ 		.extra2		= (void *)maxshift
+ 	},
+ 	{
+-		.ctl_name	= CPU_SCHED_MAX_SLEEP_AFFECT_FACTOR,
++		.ctl_name	= CPU_NICKSCHED_MAX_SLEEP_AFFECT_FACTOR,
+ 		.procname	= "max_sleep_affect_factor",
+ 		.data		= &max_sleep_affect_factor,
+ 		.maxlen		= sizeof(unsigned int),
+@@ -3762,7 +4268,7 @@
+ 		.extra2		= (void *)maxfactor
+ 	},
+ 	{
+-		.ctl_name	= CPU_SCHED_MAX_RUN_AFFECT_FACTOR,
++		.ctl_name	= CPU_NICKSCHED_MAX_RUN_AFFECT_FACTOR,
+ 		.procname	= "max_run_affect_factor",
+ 		.data		= &max_run_affect_factor,
+ 		.maxlen		= sizeof(unsigned int),
+@@ -3772,7 +4278,7 @@
+ 		.extra2		= (void *)maxfactor
+ 	},
+ 	{
+-		.ctl_name	= CPU_SCHED_MAX_WAIT_AFFECT_FACTOR,
++		.ctl_name	= CPU_NICKSCHED_MAX_WAIT_AFFECT_FACTOR,
+ 		.procname	= "max_wait_affect_factor",
+ 		.data		= &max_wait_affect_factor,
+ 		.maxlen		= sizeof(unsigned int),
+@@ -3782,7 +4288,7 @@
+ 		.extra2		= (void *)maxfactor
+ 	},
+ 	{
+-		.ctl_name	= CPU_SCHED_MIN_HISTORY_FACTOR,
++		.ctl_name	= CPU_NICKSCHED_MIN_HISTORY_FACTOR,
+ 		.procname	= "min_history_factor",
+ 		.data		= &min_history_factor,
+ 		.maxlen		= sizeof(unsigned int),
+@@ -3792,7 +4298,7 @@
+ 		.extra2		= (void *)maxfactor
+ 	},
+ 	{
+-		.ctl_name	= CPU_SCHED_SLEEP_FACTOR,
++		.ctl_name	= CPU_NICKSCHED_SLEEP_FACTOR,
+ 		.procname	= "sleep_factor",
+ 		.data		= &sleep_factor,
+ 		.maxlen		= sizeof(unsigned int),
+@@ -3801,6 +4307,106 @@
+ 		.extra1		= (void *)minsleepfactor,
+ 		.extra2		= (void *)maxsleepfactor
+ 	},
++	{ .ctl_name = CPU_NICKSCHED_END_OF_LIST }
++};
++
++ctl_table cpu_spa_table[] = {
++	{
++		.ctl_name	= CPU_SPA_MAX_IA_BONUS,
++		.procname	= "max_ia_bonus",
++		.data		= &max_ia_bonus,
++		.maxlen		= sizeof (unsigned int),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec_minmax,
++		.extra1		= (void *)&min_max_ia_bonus,
++		.extra2		= (void *)&max_max_ia_bonus
++	},
++	{
++		.ctl_name	= CPU_SPA_INITIAL_IA_BONUS,
++		.procname	= "initial_ia_bonus",
++		.data		= &initial_ia_bonus,
++		.maxlen		= sizeof (unsigned int),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec_minmax,
++		.extra1		= (void *)&min_max_ia_bonus,
++		.extra2		= (void *)&max_max_ia_bonus
++	},
++	{
++		.ctl_name	= CPU_SPA_MAX_TPT_BONUS,
++		.procname	= "max_tpt_bonus",
++		.data		= &max_tpt_bonus,
++		.maxlen		= sizeof (unsigned int),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec_minmax,
++		.extra1		= (void *)&min_max_tpt_bonus,
++		.extra2		= (void *)&max_max_tpt_bonus
++	},
++	{
++		.ctl_name	= CPU_SPA_HOG_SUB_CYCLE_THRESHOLD,
++		.procname	= "hog_sub_cycle_threshold",
++		.data		= &hog_sub_cycle_threshold,
++		.maxlen		= sizeof (unsigned int),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec_minmax,
++		.extra1		= (void *)&zero,
++		.extra2		= (void *)&max_hog_sub_cycle_threshold
++	},
++	{
++		.ctl_name	= CPU_SPA_IA_THRESHOLD,
++		.procname	= "ia_threshold",
++		.data		= &ia_threshold_ppt,
++		.maxlen		= sizeof (unsigned int),
++		.mode		= 0644,
++		.proc_handler	= &proc_ia_threshold,
++		.extra1		= (void *)&min_milli_value,
++		.extra2		= (void *)&max_milli_value
++	},
++	{
++		.ctl_name	= CPU_SPA_CPU_HOG_THRESHOLD,
++		.procname	= "cpu_hog_threshold",
++		.data		= &cpu_hog_threshold_ppt,
++		.maxlen		= sizeof (unsigned int),
++		.mode		= 0644,
++		.proc_handler	= &proc_cpu_hog_threshold,
++		.extra1		= (void *)&min_milli_value,
++		.extra2		= (void *)&max_milli_value
++	},
++	{ .ctl_name = CPU_SPA_END_OF_LIST }
++};
++
++ctl_table cpu_sched_table[] = {
++	{
++		.ctl_name	= CPU_NICKSCHED,
++		.procname	= "nicksched",
++		.mode		= 0555,
++		.child		= cpu_nicksched_table,
++	},
++	{
++		.ctl_name	= CPU_SPA,
++		.procname	= "spa",
++		.mode		= 0555,
++		.child		= cpu_spa_table,
++	},
++	{
++		.ctl_name	= CPU_SCHED_INTERACTIVE,
++		.procname	= "interactive",
++		.data		= &sched_interactive,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec_minmax,
++		.extra1		= (void *)&zero,
++		.extra2		= (void *)&one
++	},
++	{
++		.ctl_name	= CPU_SCHED_COMPUTE,
++		.procname	= "compute",
++		.data		= &sched_compute,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec_minmax,
++		.extra1		= (void *)&zero,
++		.extra2		= (void *)&one
++	},
+ 	{ .ctl_name = CPU_SCHED_END_OF_LIST }
+ };
+ 
+diff -u linux-xsched-xiphux/include/linux/init_task.h linux-xsched-xiphux/include/linux/init_task.h
+--- linux-xsched-xiphux/include/linux/init_task.h	2004-07-09 01:24:17.777512264 -0400
++++ linux-xsched-xiphux/include/linux/init_task.h	2004-07-12 23:18:43.797908864 -0400
+@@ -111,6 +111,7 @@
+ 	.proc_lock	= SPIN_LOCK_UNLOCKED,				\
+ 	.switch_lock	= SPIN_LOCK_UNLOCKED,				\
+ 	.journal_info	= NULL,						\
++	.sched_timestamp = ((INITIAL_JIFFIES * 1000000) / HZ),		\
+ }
+ 
+ 
